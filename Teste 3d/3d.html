@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AR por Marcador (iPhone)</title>
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js" crossorigin="anonymous"></script>
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; font-family: Arial, sans-serif; }
+    #cam {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+      object-fit: cover;
+      transform: scaleX(-1);
+      z-index: 0;
+    }
+    #draw {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+      z-index: 1;
+      transform: scaleX(-1);
+      touch-action: none;
+    }
+    #info {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      right: 12px;
+      z-index: 10;
+      color: #fff;
+      background: rgba(0, 0, 0, 0.45);
+      padding: 10px 12px;
+      border-radius: 10px;
+      font-size: 13px;
+      line-height: 1.35;
+      backdrop-filter: blur(3px);
+      z-index: 3;
+    }
+    #bar {
+      position: fixed;
+      bottom: 12px;
+      left: 12px;
+      right: 12px;
+      display: flex;
+      gap: 8px;
+      z-index: 4;
+    }
+    button {
+      border: 0;
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 14px;
+      font-weight: 600;
+      color: #fff;
+      background: rgba(0,0,0,0.55);
+    }
+    #msg {
+      position: fixed;
+      left: 12px;
+      right: 12px;
+      bottom: 66px;
+      display: none;
+      text-align: center;
+      color: #fff;
+      background: rgba(90, 20, 20, 0.8);
+      padding: 10px 12px;
+      border-radius: 10px;
+      z-index: 5;
+    }
+  </style>
+</head>
+<body>
+  <video id="cam" playsinline autoplay muted></video>
+  <canvas id="draw"></canvas>
+  <div id="info">
+    iPhone: AR por marcador (QR).<br>
+    Obrigatório abrir em HTTPS (ou localhost).<br>
+    1) Toque em Iniciar câmera<br>
+    2) Mostre um QR code para a câmera<br>
+    3) Toque e arraste para desenhar ancorado no QR
+  </div>
+  <div id="msg"></div>
+  <div id="bar">
+    <button id="startBtn">Iniciar câmera</button>
+    <button id="clearBtn">Limpar</button>
+  </div>
+
+  <script>
+    var video = document.getElementById('cam');
+    var canvas = document.getElementById('draw');
+    var ctx = canvas.getContext('2d');
+    var msg = document.getElementById('msg');
+    var startBtn = document.getElementById('startBtn');
+    var clearBtn = document.getElementById('clearBtn');
+
+    var procW = 320;
+    var procH = 240;
+    var procCanvas = document.createElement('canvas');
+    procCanvas.width = procW;
+    procCanvas.height = procH;
+    var procCtx = procCanvas.getContext('2d', { willReadFrequently: true });
+
+    var marker = null;
+    var localToScreen = null;
+    var screenToLocal = null;
+    var lostFrames = 0;
+    var scanTick = 0;
+
+    var anchoredStrokes = [];
+    var drawing = false;
+    var currentStroke = null;
+    var isSecurePage = (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1');
+
+    function resize() {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    function showMessage(text) {
+      msg.style.display = 'block';
+      msg.textContent = text;
+    }
+
+    function hideMessage() {
+      msg.style.display = 'none';
+      msg.textContent = '';
+    }
+
+    function solveLinearSystem(a, b) {
+      var n = b.length;
+      for (var i = 0; i < n; i++) {
+        var maxRow = i;
+        var maxVal = Math.abs(a[i][i]);
+        for (var r = i + 1; r < n; r++) {
+          var val = Math.abs(a[r][i]);
+          if (val > maxVal) {
+            maxVal = val;
+            maxRow = r;
+          }
+        }
+        if (maxVal < 1e-10) return null;
+
+        if (maxRow !== i) {
+          var tA = a[i];
+          a[i] = a[maxRow];
+          a[maxRow] = tA;
+          var tB = b[i];
+          b[i] = b[maxRow];
+          b[maxRow] = tB;
+        }
+
+        var pivot = a[i][i];
+        for (var c = i; c < n; c++) a[i][c] /= pivot;
+        b[i] /= pivot;
+
+        for (var rr = 0; rr < n; rr++) {
+          if (rr === i) continue;
+          var factor = a[rr][i];
+          if (factor === 0) continue;
+          for (var cc = i; cc < n; cc++) a[rr][cc] -= factor * a[i][cc];
+          b[rr] -= factor * b[i];
+        }
+      }
+      return b;
+    }
+
+    function buildHomography(srcPts, dstPts) {
+      var a = [];
+      var b = [];
+      for (var i = 0; i < 4; i++) {
+        var x = srcPts[i].x;
+        var y = srcPts[i].y;
+        var u = dstPts[i].x;
+        var v = dstPts[i].y;
+
+        a.push([x, y, 1, 0, 0, 0, -u * x, -u * y]);
+        b.push(u);
+        a.push([0, 0, 0, x, y, 1, -v * x, -v * y]);
+        b.push(v);
+      }
+      var h = solveLinearSystem(a, b);
+      if (!h) return null;
+
+      return [
+        [h[0], h[1], h[2]],
+        [h[3], h[4], h[5]],
+        [h[6], h[7], 1]
+      ];
+    }
+
+    function invert3x3(m) {
+      var a = m[0][0], b = m[0][1], c = m[0][2];
+      var d = m[1][0], e = m[1][1], f = m[1][2];
+      var g = m[2][0], h = m[2][1], i = m[2][2];
+
+      var A = e * i - f * h;
+      var B = c * h - b * i;
+      var C = b * f - c * e;
+      var D = f * g - d * i;
+      var E = a * i - c * g;
+      var F = c * d - a * f;
+      var G = d * h - e * g;
+      var H = b * g - a * h;
+      var I = a * e - b * d;
+
+      var det = a * A + b * D + c * G;
+      if (Math.abs(det) < 1e-12) return null;
+      var invDet = 1 / det;
+      return [
+        [A * invDet, B * invDet, C * invDet],
+        [D * invDet, E * invDet, F * invDet],
+        [G * invDet, H * invDet, I * invDet]
+      ];
+    }
+
+    function mapPoint(h, x, y) {
+      var den = h[2][0] * x + h[2][1] * y + h[2][2];
+      if (Math.abs(den) < 1e-8) return null;
+      return {
+        x: (h[0][0] * x + h[0][1] * y + h[0][2]) / den,
+        y: (h[1][0] * x + h[1][1] * y + h[1][2]) / den
+      };
+    }
+
+    function detectMarker() {
+      if (video.readyState < 2) return;
+
+      scanTick++;
+      if (scanTick % 2 !== 0) return;
+
+      procCtx.drawImage(video, 0, 0, procW, procH);
+      var imageData = procCtx.getImageData(0, 0, procW, procH);
+      var code = jsQR(imageData.data, procW, procH, { inversionAttempts: 'attemptBoth' });
+
+      if (!code || !code.location) {
+        lostFrames++;
+        if (lostFrames > 15) {
+          marker = null;
+          localToScreen = null;
+          screenToLocal = null;
+        }
+        return;
+      }
+
+      var sx = canvas.width / procW;
+      var sy = canvas.height / procH;
+      var now = [
+        { x: code.location.topLeftCorner.x * sx, y: code.location.topLeftCorner.y * sy },
+        { x: code.location.topRightCorner.x * sx, y: code.location.topRightCorner.y * sy },
+        { x: code.location.bottomRightCorner.x * sx, y: code.location.bottomRightCorner.y * sy },
+        { x: code.location.bottomLeftCorner.x * sx, y: code.location.bottomLeftCorner.y * sy }
+      ];
+
+      if (!marker) marker = now;
+      else {
+        for (var i = 0; i < 4; i++) {
+          marker[i].x += (now[i].x - marker[i].x) * 0.45;
+          marker[i].y += (now[i].y - marker[i].y) * 0.45;
+        }
+      }
+
+      var localQuad = [
+        { x: 0, y: 0 },
+        { x: 1, y: 0 },
+        { x: 1, y: 1 },
+        { x: 0, y: 1 }
+      ];
+      localToScreen = buildHomography(localQuad, marker);
+      screenToLocal = localToScreen ? invert3x3(localToScreen) : null;
+      lostFrames = 0;
+      hideMessage();
+    }
+
+    function drawStroke(points, color) {
+      if (!points.length) return;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 5;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+
+      if (points.length === 1) {
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(points[0].x, points[0].y, 2.5, 0, Math.PI * 2);
+        ctx.fill();
+        return;
+      }
+
+      ctx.beginPath();
+      ctx.moveTo(points[0].x, points[0].y);
+      for (var i = 1; i < points.length - 1; i++) {
+        var mx = (points[i].x + points[i + 1].x) * 0.5;
+        var my = (points[i].y + points[i + 1].y) * 0.5;
+        ctx.quadraticCurveTo(points[i].x, points[i].y, mx, my);
+      }
+      ctx.lineTo(points[points.length - 1].x, points[points.length - 1].y);
+      ctx.stroke();
+    }
+
+    function render() {
+      detectMarker();
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      if (marker) {
+        ctx.strokeStyle = 'rgba(120, 255, 190, 0.9)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(marker[0].x, marker[0].y);
+        ctx.lineTo(marker[1].x, marker[1].y);
+        ctx.lineTo(marker[2].x, marker[2].y);
+        ctx.lineTo(marker[3].x, marker[3].y);
+        ctx.closePath();
+        ctx.stroke();
+      }
+
+      for (var s = 0; s < anchoredStrokes.length; s++) {
+        var st = anchoredStrokes[s];
+        var screenPts = [];
+        for (var p = 0; p < st.points.length; p++) {
+          if (!localToScreen) break;
+          var sp = mapPoint(localToScreen, st.points[p].u, st.points[p].v);
+          if (sp) screenPts.push(sp);
+        }
+        drawStroke(screenPts, st.color);
+      }
+
+      requestAnimationFrame(render);
+    }
+
+    function getCanvasPoint(e) {
+      var touch = e.touches[0] || e.changedTouches[0];
+      var x = canvas.width - touch.clientX;
+      var y = touch.clientY;
+      return { x: x, y: y };
+    }
+
+    canvas.addEventListener('touchstart', function(e) {
+      e.preventDefault();
+      if (!screenToLocal) {
+        showMessage('Mostre um QR code para começar a desenhar.');
+        return;
+      }
+      var p = getCanvasPoint(e);
+      var lp = mapPoint(screenToLocal, p.x, p.y);
+      if (!lp) return;
+
+      drawing = true;
+      currentStroke = { color: '#FFD76A', points: [{ u: lp.x, v: lp.y }] };
+      anchoredStrokes.push(currentStroke);
+    }, { passive: false });
+
+    canvas.addEventListener('touchmove', function(e) {
+      e.preventDefault();
+      if (!drawing || !currentStroke || !screenToLocal) return;
+      var p = getCanvasPoint(e);
+      var lp = mapPoint(screenToLocal, p.x, p.y);
+      if (!lp) return;
+      currentStroke.points.push({ u: lp.x, v: lp.y });
+    }, { passive: false });
+
+    canvas.addEventListener('touchend', function() {
+      drawing = false;
+      currentStroke = null;
+    }, { passive: true });
+
+    clearBtn.addEventListener('click', function() {
+      anchoredStrokes = [];
+    });
+
+    startBtn.addEventListener('click', async function() {
+      if (!isSecurePage) {
+        showMessage('HTTPS obrigatório: abra este link com https:// para usar a câmera no iPhone.');
+        return;
+      }
+      try {
+        var stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: 'environment' },
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          },
+          audio: false
+        });
+        video.srcObject = stream;
+        await video.play();
+        startBtn.disabled = true;
+        startBtn.textContent = 'Câmera ativa';
+        showMessage('Aponte para um QR code.');
+      } catch (err) {
+        showMessage('Não foi possível abrir a câmera. Use HTTPS e permita acesso.');
+      }
+    });
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      showMessage('Seu navegador não suporta câmera via getUserMedia.');
+    } else if (!isSecurePage) {
+      showMessage('HTTPS obrigatório no iPhone. Use URL com https:// (ex.: localtunnel/cloudflared).');
+    }
+
+    render();
+  </script>
+</body>
+</html>

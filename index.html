@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Drawing with Hands</title>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js" crossorigin="anonymous"></script>
+  <style>
+    body { margin: 0; background: #050301; overflow: hidden; }
+    video { display: none; }
+    canvas { width: 100%; height: 100%; transform: scaleX(-1); position: absolute; z-index: 1; }
+  </style>
+</head>
+<body>
+  <video id="vid"></video>
+  <canvas id="c"></canvas>
+  <script>
+    var vid = document.getElementById('vid');
+    var c = document.getElementById('c');
+    var ctx = c.getContext('2d');
+    var arr = [];
+    var anchoredArr = [];
+    var cur = [];
+    var draw = false;
+    var sx = null;
+    var sy = null;
+    var palette = ['#F5D061', '#FF6B6B', '#4ECDC4', '#45B7D1', '#C56CF0', '#FFFFFF'];
+    var colorIndex = 0;
+    var selectedColor = '#F5D061';
+    var pinch = false;
+    var pinchThreshold = 0.06;
+    var pinchRelease = 0.085;
+    var eraserMode = false;
+    var eraserRadius = 22;
+    var eraserMinRadius = 8;
+    var eraserMaxRadius = 64;
+    var eraserStep = 4;
+    var smoothLines = true;
+    var ctrlHeld = false;
+    var altHeld = false;
+    var moveLastX = null;
+    var moveLastY = null;
+    var anchorMode = true;
+    var markerTracked = false;
+    var markerLostFrames = 0;
+    var markerCorners = null;
+    var markerLocalToScreen = null;
+    var markerScreenToLocal = null;
+    var qrScanTick = 0;
+    var procW = 320;
+    var procH = 180;
+    var procCanvas = document.createElement('canvas');
+    procCanvas.width = procW;
+    procCanvas.height = procH;
+    var procCtx = procCanvas.getContext('2d', { willReadFrequently: true });
+
+    function solveLinearSystem(a, b) {
+      var n = b.length;
+      for (var i = 0; i < n; i++) {
+        var maxRow = i;
+        var maxVal = Math.abs(a[i][i]);
+        for (var r = i + 1; r < n; r++) {
+          var val = Math.abs(a[r][i]);
+          if (val > maxVal) {
+            maxVal = val;
+            maxRow = r;
+          }
+        }
+        if (maxVal < 1e-10) return null;
+
+        if (maxRow !== i) {
+          var tmp = a[i];
+          a[i] = a[maxRow];
+          a[maxRow] = tmp;
+          var tmpB = b[i];
+          b[i] = b[maxRow];
+          b[maxRow] = tmpB;
+        }
+
+        var pivot = a[i][i];
+        for (var c = i; c < n; c++) a[i][c] /= pivot;
+        b[i] /= pivot;
+
+        for (var rr = 0; rr < n; rr++) {
+          if (rr === i) continue;
+          var factor = a[rr][i];
+          if (factor === 0) continue;
+          for (var cc = i; cc < n; cc++) a[rr][cc] -= factor * a[i][cc];
+          b[rr] -= factor * b[i];
+        }
+      }
+      return b;
+    }
+
+    function buildHomography(srcPts, dstPts) {
+      var a = [];
+      var b = [];
+      for (var i = 0; i < 4; i++) {
+        var x = srcPts[i].x;
+        var y = srcPts[i].y;
+        var u = dstPts[i].x;
+        var v = dstPts[i].y;
+
+        a.push([x, y, 1, 0, 0, 0, -u * x, -u * y]);
+        b.push(u);
+        a.push([0, 0, 0, x, y, 1, -v * x, -v * y]);
+        b.push(v);
+      }
+
+      var h = solveLinearSystem(a, b);
+      if (!h) return null;
+
+      return [
+        [h[0], h[1], h[2]],
+        [h[3], h[4], h[5]],
+        [h[6], h[7], 1]
+      ];
+    }
+
+    function invert3x3(m) {
+      var a = m[0][0], b = m[0][1], c = m[0][2];
+      var d = m[1][0], e = m[1][1], f = m[1][2];
+      var g = m[2][0], h = m[2][1], i = m[2][2];
+
+      var A = e * i - f * h;
+      var B = c * h - b * i;
+      var C = b * f - c * e;
+      var D = f * g - d * i;
+      var E = a * i - c * g;
+      var F = c * d - a * f;
+      var G = d * h - e * g;
+      var H = b * g - a * h;
+      var I = a * e - b * d;
+
+      var det = a * A + b * D + c * G;
+      if (Math.abs(det) < 1e-12) return null;
+
+      var invDet = 1 / det;
+      return [
+        [A * invDet, B * invDet, C * invDet],
+        [D * invDet, E * invDet, F * invDet],
+        [G * invDet, H * invDet, I * invDet]
+      ];
+    }
+
+    function applyHomography(h, x, y) {
+      var den = h[2][0] * x + h[2][1] * y + h[2][2];
+      if (Math.abs(den) < 1e-8) return null;
+      return {
+        x: (h[0][0] * x + h[0][1] * y + h[0][2]) / den,
+        y: (h[1][0] * x + h[1][1] * y + h[1][2]) / den
+      };
+    }
+
+    function updateMarkerTracking(frameImage) {
+      qrScanTick++;
+      if (qrScanTick % 2 !== 0) return;
+
+      procCtx.drawImage(frameImage, 0, 0, procW, procH);
+      var imageData = procCtx.getImageData(0, 0, procW, procH);
+      var code = jsQR(imageData.data, procW, procH, { inversionAttempts: 'attemptBoth' });
+
+      if (!code || !code.location) {
+        markerLostFrames++;
+        if (markerLostFrames > 12) {
+          markerTracked = false;
+          markerCorners = null;
+          markerLocalToScreen = null;
+          markerScreenToLocal = null;
+        }
+        return;
+      }
+
+      var sx = c.width / procW;
+      var sy = c.height / procH;
+      var detected = [
+        { x: code.location.topLeftCorner.x * sx, y: code.location.topLeftCorner.y * sy },
+        { x: code.location.topRightCorner.x * sx, y: code.location.topRightCorner.y * sy },
+        { x: code.location.bottomRightCorner.x * sx, y: code.location.bottomRightCorner.y * sy },
+        { x: code.location.bottomLeftCorner.x * sx, y: code.location.bottomLeftCorner.y * sy }
+      ];
+
+      if (!markerCorners) {
+        markerCorners = detected;
+      } else {
+        var smooth = 0.45;
+        for (var i = 0; i < 4; i++) {
+          markerCorners[i].x += (detected[i].x - markerCorners[i].x) * smooth;
+          markerCorners[i].y += (detected[i].y - markerCorners[i].y) * smooth;
+        }
+      }
+
+      var localQuad = [
+        { x: 0, y: 0 },
+        { x: 1, y: 0 },
+        { x: 1, y: 1 },
+        { x: 0, y: 1 }
+      ];
+
+      markerLocalToScreen = buildHomography(localQuad, markerCorners);
+      markerScreenToLocal = markerLocalToScreen ? invert3x3(markerLocalToScreen) : null;
+      markerTracked = !!(markerLocalToScreen && markerScreenToLocal);
+      markerLostFrames = 0;
+    }
+
+    function drawAnchoredStrokes() {
+      if (!markerTracked || !markerLocalToScreen) return;
+
+      for (var i = 0; i < anchoredArr.length; i++) {
+        var stroke = anchoredArr[i];
+        var projected = [];
+        projected.color = stroke.color;
+
+        for (var j = 0; j < stroke.length; j++) {
+          var sp = applyHomography(markerLocalToScreen, stroke[j].u, stroke[j].v);
+          if (!sp) continue;
+          projected.push({ x: sp.x, y: sp.y });
+        }
+
+        if (projected.length > 0) drawStroke(projected);
+      }
+    }
+
+    function eraseAnchoredAtScreen(x, y, radius) {
+      if (!markerTracked || !markerLocalToScreen) return;
+
+      var next = [];
+      for (var i = 0; i < anchoredArr.length; i++) {
+        var stroke = anchoredArr[i];
+        var segment = [];
+        segment.color = stroke.color;
+
+        for (var j = 0; j < stroke.length; j++) {
+          var p = applyHomography(markerLocalToScreen, stroke[j].u, stroke[j].v);
+          var keepPoint = p && Math.hypot(p.x - x, p.y - y) > radius;
+
+          if (keepPoint) {
+            segment.push({ u: stroke[j].u, v: stroke[j].v });
+          } else {
+            if (segment.length > 0) {
+              segment.color = stroke.color;
+              next.push(segment);
+            }
+            segment = [];
+            segment.color = stroke.color;
+          }
+        }
+
+        if (segment.length > 0) {
+          segment.color = stroke.color;
+          next.push(segment);
+        }
+      }
+
+      anchoredArr = next;
+    }
+
+    function drawStroke(stroke) {
+      if (!stroke || stroke.length === 0) return;
+
+      ctx.shadowColor = stroke.color || '#F5D061';
+      ctx.strokeStyle = stroke.color || '#F5D061';
+
+      if (stroke.length === 1) {
+        ctx.beginPath();
+        ctx.fillStyle = stroke.color || '#F5D061';
+        ctx.arc(stroke[0].x, stroke[0].y, 3, 0, Math.PI * 2);
+        ctx.fill();
+        return;
+      }
+
+      ctx.beginPath();
+      ctx.moveTo(stroke[0].x, stroke[0].y);
+
+      if (smoothLines && stroke.length > 2) {
+        for (var i = 1; i < stroke.length - 1; i++) {
+          var mx = (stroke[i].x + stroke[i + 1].x) * 0.5;
+          var my = (stroke[i].y + stroke[i + 1].y) * 0.5;
+          ctx.quadraticCurveTo(stroke[i].x, stroke[i].y, mx, my);
+        }
+        ctx.lineTo(stroke[stroke.length - 1].x, stroke[stroke.length - 1].y);
+      } else {
+        for (var j = 1; j < stroke.length; j++) {
+          ctx.lineTo(stroke[j].x, stroke[j].y);
+        }
+      }
+
+      ctx.stroke();
+    }
+
+    function eraseAt(x, y, radius) {
+      var next = [];
+
+      for (var i = 0; i < arr.length; i++) {
+        var stroke = arr[i];
+        if (!stroke || stroke.length === 0) continue;
+
+        var segment = [];
+        segment.color = stroke.color;
+
+        for (var j = 0; j < stroke.length; j++) {
+          var p = stroke[j];
+          var keepPoint = Math.hypot(p.x - x, p.y - y) > radius;
+
+          if (keepPoint) {
+            segment.push({x: p.x, y: p.y});
+          } else {
+            if (segment.length > 0) {
+              segment.color = stroke.color;
+              next.push(segment);
+            }
+            segment = [];
+            segment.color = stroke.color;
+          }
+        }
+
+        if (segment.length > 0) {
+          segment.color = stroke.color;
+          next.push(segment);
+        }
+      }
+
+      arr = next;
+    }
+
+    window.onkeydown = function(e) {
+      if (e.key == 'Control' && !ctrlHeld) {
+        ctrlHeld = true;
+        colorIndex = (colorIndex + 1) % palette.length;
+        selectedColor = palette[colorIndex];
+      }
+      if (e.key == 'e' || e.key == 'E') {
+        eraserMode = !eraserMode;
+        draw = false;
+      }
+      if (e.key == 'a' || e.key == 'A') {
+        anchorMode = !anchorMode;
+        draw = false;
+      }
+      if (e.key == 's' || e.key == 'S') {
+        smoothLines = !smoothLines;
+      }
+      if (e.key == '[' || e.key == '{') {
+        eraserRadius = Math.max(eraserMinRadius, eraserRadius - eraserStep);
+      }
+      if (e.key == ']' || e.key == '}') {
+        eraserRadius = Math.min(eraserMaxRadius, eraserRadius + eraserStep);
+      }
+      if (e.key == 'Alt') {
+        altHeld = true;
+        draw = false;
+      }
+      if (e.code == 'Space') {
+        arr = [];
+        anchoredArr = [];
+      }
+    }
+    
+    window.onkeyup = function(e) {
+      if (e.key == 'Control') ctrlHeld = false;
+      if (e.key == 'Alt') {
+        altHeld = false;
+        moveLastX = null;
+        moveLastY = null;
+      }
+    }
+
+    function run(res) {
+      c.width = window.innerWidth;
+      c.height = window.innerHeight;
+      ctx.drawImage(res.image, 0, 0, c.width, c.height);
+      ctx.fillStyle = 'rgba(10, 6, 2, 0.85)';
+      ctx.fillRect(0, 0, c.width, c.height);
+
+      var menuW = 54;
+      var itemSize = 34;
+      var gap = 14;
+      var topPad = 22;
+      var menuX = c.width - menuW - 14;
+
+      ctx.shadowColor = '#F5D061';
+      ctx.shadowBlur = 15;
+      ctx.lineWidth = 6;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+
+      updateMarkerTracking(res.image);
+
+      if (markerTracked && markerCorners) {
+        ctx.strokeStyle = 'rgba(80, 255, 170, 0.85)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(markerCorners[0].x, markerCorners[0].y);
+        ctx.lineTo(markerCorners[1].x, markerCorners[1].y);
+        ctx.lineTo(markerCorners[2].x, markerCorners[2].y);
+        ctx.lineTo(markerCorners[3].x, markerCorners[3].y);
+        ctx.closePath();
+        ctx.stroke();
+      }
+
+      for (var i = 0; i < arr.length; i++) {
+        drawStroke(arr[i]);
+      }
+
+      drawAnchoredStrokes();
+
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.08)';
+      ctx.fillRect(menuX - 8, topPad - 8, menuW + 16, palette.length * (itemSize + gap) - gap + 16);
+
+      for (var k = 0; k < palette.length; k++) {
+        var iy = topPad + k * (itemSize + gap);
+        var isSelected = selectedColor == palette[k];
+        ctx.beginPath();
+        ctx.fillStyle = palette[k];
+        ctx.arc(menuX + menuW / 2, iy + itemSize / 2, itemSize / 2, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.lineWidth = isSelected ? 4 : 2;
+        ctx.strokeStyle = isSelected ? '#FFFFFF' : 'rgba(255,255,255,0.45)';
+        ctx.stroke();
+      }
+
+      if (res.multiHandLandmarks && res.multiHandLandmarks.length > 0) {
+        var lm = res.multiHandLandmarks[0];
+        drawConnectors(ctx, lm, HAND_CONNECTIONS, {color: 'rgba(245, 208, 97, 0.3)', lineWidth: 2});
+        drawLandmarks(ctx, lm, {color: '#FFFFFF', lineWidth: 1, radius: 2});
+
+        var ind = lm[8];
+        var rx = ind.x * c.width;
+        var ry = ind.y * c.height;
+
+        if (sx == null) {
+          sx = rx; 
+          sy = ry;
+        } else {
+          sx += (rx - sx) * 0.45;
+          sy += (ry - sy) * 0.45;
+        }
+
+        var thumb = lm[4];
+
+        var pinchDist = Math.hypot(ind.x - thumb.x, ind.y - thumb.y);
+        var pinchNow = pinch ? (pinchDist < pinchRelease) : (pinchDist < pinchThreshold);
+
+        pinch = pinchNow;
+
+        ctx.beginPath();
+        ctx.arc(sx, sy, 6, 0, 2 * Math.PI);
+        if (eraserMode) {
+          ctx.fillStyle = 'rgba(255, 120, 120, 0.9)';
+        } else if (pinchNow) { 
+          ctx.fillStyle = '#FFFFFF'; 
+        } else { 
+          ctx.fillStyle = 'rgba(245, 208, 97, 0.4)'; 
+        }
+        ctx.fill();
+
+        if (eraserMode) {
+          ctx.beginPath();
+          ctx.strokeStyle = 'rgba(255, 120, 120, 0.8)';
+          ctx.lineWidth = 2;
+          ctx.arc(sx, sy, eraserRadius, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.lineWidth = 6;
+        }
+
+        ctx.fillStyle = 'rgba(255,255,255,0.85)';
+        ctx.font = '14px Arial';
+        var modeText = eraserMode ? 'Modo: Borracha (E)' : 'Modo: Desenho (E)';
+        var smoothText = smoothLines ? 'Suavização: ON (S)' : 'Suavização: OFF (S)';
+        var eraserText = 'Borracha: ' + eraserRadius + ' ([ / ])';
+        var altText = 'Alt: mover desenho';
+        var anchorText = anchorMode ? 'Ancoragem QR: ON (A)' : 'Ancoragem QR: OFF (A)';
+        var markerText = markerTracked ? 'QR detectado' : 'Mostre um QR code para ancorar';
+        ctx.fillText(modeText, 18, 28);
+        ctx.fillText(smoothText, 18, 48);
+        ctx.fillText(eraserText, 18, 68);
+        ctx.fillText(altText, 18, 88);
+        ctx.fillText(anchorText, 18, 108);
+        ctx.fillText(markerText, 18, 128);
+
+        if (altHeld) {
+          if (moveLastX == null) {
+            moveLastX = sx;
+            moveLastY = sy;
+          } else {
+            var dxMove = sx - moveLastX;
+            var dyMove = sy - moveLastY;
+            if (dxMove !== 0 || dyMove !== 0) {
+              for (var m = 0; m < arr.length; m++) {
+                for (var n = 0; n < arr[m].length; n++) {
+                  arr[m][n].x += dxMove;
+                  arr[m][n].y += dyMove;
+                }
+              }
+            }
+
+            moveLastX = sx;
+            moveLastY = sy;
+          }
+          draw = false;
+        } else if (eraserMode && pinchNow) {
+          moveLastX = null;
+          moveLastY = null;
+          draw = false;
+          eraseAt(sx, sy, eraserRadius);
+          if (anchorMode) eraseAnchoredAtScreen(sx, sy, eraserRadius);
+        } else if (pinchNow) {
+          moveLastX = null;
+          moveLastY = null;
+          if (anchorMode && markerTracked && markerScreenToLocal) {
+            var localPoint = applyHomography(markerScreenToLocal, sx, sy);
+            if (localPoint) {
+              if (!draw) {
+                draw = true;
+                cur = [];
+                cur.color = selectedColor;
+                anchoredArr.push(cur);
+              }
+              cur.push({ u: localPoint.x, v: localPoint.y });
+            }
+          } else {
+            if (!draw) {
+              draw = true;
+              cur = [];
+              cur.color = selectedColor;
+              arr.push(cur);
+            }
+            cur.push({x: sx, y: sy});
+          }
+        } else {
+          draw = false;
+          moveLastX = null;
+          moveLastY = null;
+        }
+      } else {
+        draw = false;
+        sx = null;
+        pinch = false;
+        moveLastX = null;
+        moveLastY = null;
+      }
+    }
+
+    var h = new Hands({
+      locateFile: (file) => {
+        return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+      }
+    });
+    
+    h.setOptions({ 
+      maxNumHands: 1, 
+      modelComplexity: 1, 
+      minDetectionConfidence: 0.5, 
+      minTrackingConfidence: 0.5 
+    });
+    
+    h.onResults(run);
+
+    var cam = new Camera(vid, {
+      onFrame: async () => { await h.send({image: vid}); },
+      width: 1280,
+      height: 720
+    });
+    
+    cam.start();
+  </script>
+</body>
+</html>

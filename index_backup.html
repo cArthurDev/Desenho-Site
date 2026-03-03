@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Drawing with Hands</title>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+  <style>
+    body { margin: 0; background: #050301; overflow: hidden; }
+    video { display: none; }
+    canvas { width: 100%; height: 100%; transform: scaleX(-1); position: absolute; z-index: 1; }
+  </style>
+</head>
+<body>
+  <video id="vid"></video>
+  <canvas id="c"></canvas>
+  <script>
+    var vid = document.getElementById('vid');
+    var c = document.getElementById('c');
+    var ctx = c.getContext('2d');
+    var arr = [];
+    var cur = [];
+    var draw = false;
+    var sx = null;
+    var sy = null;
+    var palette = ['#F5D061', '#FF6B6B', '#4ECDC4', '#45B7D1', '#C56CF0', '#FFFFFF'];
+    var colorIndex = 0;
+    var selectedColor = '#F5D061';
+    var pinch = false;
+    var pinchThreshold = 0.06;
+    var pinchRelease = 0.085;
+    var eraserMode = false;
+    var eraserRadius = 22;
+    var eraserMinRadius = 8;
+    var eraserMaxRadius = 64;
+    var eraserStep = 4;
+    var smoothLines = true;
+    var ctrlHeld = false;
+    var altHeld = false;
+    var moveLastX = null;
+    var moveLastY = null;
+
+    function drawStroke(stroke) {
+      if (!stroke || stroke.length === 0) return;
+
+      ctx.shadowColor = stroke.color || '#F5D061';
+      ctx.strokeStyle = stroke.color || '#F5D061';
+
+      if (stroke.length === 1) {
+        ctx.beginPath();
+        ctx.fillStyle = stroke.color || '#F5D061';
+        ctx.arc(stroke[0].x, stroke[0].y, 3, 0, Math.PI * 2);
+        ctx.fill();
+        return;
+      }
+
+      ctx.beginPath();
+      ctx.moveTo(stroke[0].x, stroke[0].y);
+
+      if (smoothLines && stroke.length > 2) {
+        for (var i = 1; i < stroke.length - 1; i++) {
+          var mx = (stroke[i].x + stroke[i + 1].x) * 0.5;
+          var my = (stroke[i].y + stroke[i + 1].y) * 0.5;
+          ctx.quadraticCurveTo(stroke[i].x, stroke[i].y, mx, my);
+        }
+        ctx.lineTo(stroke[stroke.length - 1].x, stroke[stroke.length - 1].y);
+      } else {
+        for (var j = 1; j < stroke.length; j++) {
+          ctx.lineTo(stroke[j].x, stroke[j].y);
+        }
+      }
+
+      ctx.stroke();
+    }
+
+    function eraseAt(x, y, radius) {
+      var next = [];
+
+      for (var i = 0; i < arr.length; i++) {
+        var stroke = arr[i];
+        if (!stroke || stroke.length === 0) continue;
+
+        var segment = [];
+        segment.color = stroke.color;
+
+        for (var j = 0; j < stroke.length; j++) {
+          var p = stroke[j];
+          var keepPoint = Math.hypot(p.x - x, p.y - y) > radius;
+
+          if (keepPoint) {
+            segment.push({x: p.x, y: p.y});
+          } else {
+            if (segment.length > 0) {
+              segment.color = stroke.color;
+              next.push(segment);
+            }
+            segment = [];
+            segment.color = stroke.color;
+          }
+        }
+
+        if (segment.length > 0) {
+          segment.color = stroke.color;
+          next.push(segment);
+        }
+      }
+
+      arr = next;
+    }
+
+    window.onkeydown = function(e) {
+      if (e.key == 'Control' && !ctrlHeld) {
+        ctrlHeld = true;
+        colorIndex = (colorIndex + 1) % palette.length;
+        selectedColor = palette[colorIndex];
+      }
+      if (e.key == 'e' || e.key == 'E') {
+        eraserMode = !eraserMode;
+        draw = false;
+      }
+      if (e.key == 's' || e.key == 'S') {
+        smoothLines = !smoothLines;
+      }
+      if (e.key == '[' || e.key == '{') {
+        eraserRadius = Math.max(eraserMinRadius, eraserRadius - eraserStep);
+      }
+      if (e.key == ']' || e.key == '}') {
+        eraserRadius = Math.min(eraserMaxRadius, eraserRadius + eraserStep);
+      }
+      if (e.key == 'Alt') {
+        altHeld = true;
+        draw = false;
+      }
+      if (e.code == 'Space') {
+        arr = [];
+      }
+    }
+    
+    window.onkeyup = function(e) {
+      if (e.key == 'Control') ctrlHeld = false;
+      if (e.key == 'Alt') {
+        altHeld = false;
+        moveLastX = null;
+        moveLastY = null;
+      }
+    }
+
+    function run(res) {
+      c.width = window.innerWidth;
+      c.height = window.innerHeight;
+      ctx.drawImage(res.image, 0, 0, c.width, c.height);
+      ctx.fillStyle = 'rgba(10, 6, 2, 0.85)';
+      ctx.fillRect(0, 0, c.width, c.height);
+
+      var menuW = 54;
+      var itemSize = 34;
+      var gap = 14;
+      var topPad = 22;
+      var menuX = c.width - menuW - 14;
+
+      ctx.shadowColor = '#F5D061';
+      ctx.shadowBlur = 15;
+      ctx.lineWidth = 6;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+
+      for (var i = 0; i < arr.length; i++) {
+        drawStroke(arr[i]);
+      }
+
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.08)';
+      ctx.fillRect(menuX - 8, topPad - 8, menuW + 16, palette.length * (itemSize + gap) - gap + 16);
+
+      for (var k = 0; k < palette.length; k++) {
+        var iy = topPad + k * (itemSize + gap);
+        var isSelected = selectedColor == palette[k];
+        ctx.beginPath();
+        ctx.fillStyle = palette[k];
+        ctx.arc(menuX + menuW / 2, iy + itemSize / 2, itemSize / 2, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.lineWidth = isSelected ? 4 : 2;
+        ctx.strokeStyle = isSelected ? '#FFFFFF' : 'rgba(255,255,255,0.45)';
+        ctx.stroke();
+      }
+
+      if (res.multiHandLandmarks && res.multiHandLandmarks.length > 0) {
+        var lm = res.multiHandLandmarks[0];
+        drawConnectors(ctx, lm, HAND_CONNECTIONS, {color: 'rgba(245, 208, 97, 0.3)', lineWidth: 2});
+        drawLandmarks(ctx, lm, {color: '#FFFFFF', lineWidth: 1, radius: 2});
+
+        var ind = lm[8];
+        var rx = ind.x * c.width;
+        var ry = ind.y * c.height;
+
+        if (sx == null) {
+          sx = rx; 
+          sy = ry;
+        } else {
+          sx += (rx - sx) * 0.45;
+          sy += (ry - sy) * 0.45;
+        }
+
+        var thumb = lm[4];
+
+        var pinchDist = Math.hypot(ind.x - thumb.x, ind.y - thumb.y);
+        var pinchNow = pinch ? (pinchDist < pinchRelease) : (pinchDist < pinchThreshold);
+
+        pinch = pinchNow;
+
+        ctx.beginPath();
+        ctx.arc(sx, sy, 6, 0, 2 * Math.PI);
+        if (eraserMode) {
+          ctx.fillStyle = 'rgba(255, 120, 120, 0.9)';
+        } else if (pinchNow) { 
+          ctx.fillStyle = '#FFFFFF'; 
+        } else { 
+          ctx.fillStyle = 'rgba(245, 208, 97, 0.4)'; 
+        }
+        ctx.fill();
+
+        if (eraserMode) {
+          ctx.beginPath();
+          ctx.strokeStyle = 'rgba(255, 120, 120, 0.8)';
+          ctx.lineWidth = 2;
+          ctx.arc(sx, sy, eraserRadius, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.lineWidth = 6;
+        }
+
+        ctx.fillStyle = 'rgba(255,255,255,0.85)';
+        ctx.font = '14px Arial';
+        var modeText = eraserMode ? 'Modo: Borracha (E)' : 'Modo: Desenho (E)';
+        var smoothText = smoothLines ? 'Suavização: ON (S)' : 'Suavização: OFF (S)';
+        var eraserText = 'Borracha: ' + eraserRadius + ' ([ / ])';
+        var altText = 'Alt: mover desenho';
+        ctx.fillText(modeText, 18, 28);
+        ctx.fillText(smoothText, 18, 48);
+        ctx.fillText(eraserText, 18, 68);
+        ctx.fillText(altText, 18, 88);
+
+        if (altHeld) {
+          if (moveLastX == null) {
+            moveLastX = sx;
+            moveLastY = sy;
+          } else {
+            var dxMove = sx - moveLastX;
+            var dyMove = sy - moveLastY;
+            if (dxMove !== 0 || dyMove !== 0) {
+              for (var m = 0; m < arr.length; m++) {
+                for (var n = 0; n < arr[m].length; n++) {
+                  arr[m][n].x += dxMove;
+                  arr[m][n].y += dyMove;
+                }
+              }
+            }
+
+            moveLastX = sx;
+            moveLastY = sy;
+          }
+          draw = false;
+        } else if (eraserMode && pinchNow) {
+          moveLastX = null;
+          moveLastY = null;
+          draw = false;
+          eraseAt(sx, sy, eraserRadius);
+        } else if (pinchNow) {
+          moveLastX = null;
+          moveLastY = null;
+          if (!draw) {
+            draw = true;
+            cur = [];
+            cur.color = selectedColor;
+            arr.push(cur);
+          }
+          cur.push({x: sx, y: sy});
+        } else {
+          draw = false;
+          moveLastX = null;
+          moveLastY = null;
+        }
+      } else {
+        draw = false;
+        sx = null;
+        pinch = false;
+        moveLastX = null;
+        moveLastY = null;
+      }
+    }
+
+    var h = new Hands({
+      locateFile: (file) => {
+        return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+      }
+    });
+    
+    h.setOptions({ 
+      maxNumHands: 1, 
+      modelComplexity: 1, 
+      minDetectionConfidence: 0.5, 
+      minTrackingConfidence: 0.5 
+    });
+    
+    h.onResults(run);
+
+    var cam = new Camera(vid, {
+      onFrame: async () => { await h.send({image: vid}); },
+      width: 1280,
+      height: 720
+    });
+    
+    cam.start();
+  </script>
+</body>
+</html>
